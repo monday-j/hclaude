@@ -10,7 +10,7 @@
 main() {
   set -euo pipefail
 
-  local repo="${HCLAUDE_REPO:-https://github.com:monday-j/hclaude.git}"
+  local repo="${HCLAUDE_REPO:-https://github.com/monday-j/hclaude.git}"
   local dest="${HCLAUDE_DIR:-$HOME/.local/share/hclaude}"
   local bin="${HCLAUDE_BIN:-$HOME/.local/bin/claude}"
 
