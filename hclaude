@@ -1,0 +1,286 @@
+#!/bin/bash
+# Run Claude Code inside a podman+krun microVM with only the project mounted.
+# Install: curl -fsSL https://raw.githubusercontent.com/monday-j/hclaude/main/install.sh | bash
+# (links this as ~/.local/bin/claude). Manual: ln -s "$PWD/hclaude" ~/.local/bin/<name>
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+HERE="$(dirname "$SELF")"
+
+BASE_IMAGE="hclaude-base"
+CONFIG_VOLUME="hclaude-config"
+RAM_MIB="${HCLAUDE_RAM_MIB:-4096}"
+CPUS="${HCLAUDE_CPUS:-4}"
+UPDATE_DAYS="${HCLAUDE_UPDATE_DAYS:-7}"
+INSTALL_DIR="${HCLAUDE_DIR:-$HOME/.local/share/hclaude}"
+BIN_LINK="${HCLAUDE_BIN:-$HOME/.local/bin/claude}"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [claude args...]        run claude in the current directory, sandboxed
+       $(basename "$0") <command> [args]
+
+Images are built automatically on first use; init and build are optional.
+
+  init [dir]            scaffold .hclaude/Containerfile for per-project toolchains
+  build [dir]           (re)build the base image and the project image; picks up new Claude Code releases
+  update                pull the latest wrapper, then rebuild the images (latest Claude Code)
+  run [dir] [-- cmd..]  start the microVM in dir (default command: claude)
+  shell [dir]           same as: run [dir] -- bash
+  netcheck host:port..  from inside a VM, report which of these targets are reachable
+  import-claude-md      copy ~/.claude/CLAUDE.md into the sandbox config volume (opt-in)
+  uninstall             remove the wrapper; asks before removing images and the config volume
+  help                  this text
+
+Anything that is not a command above is passed to claude (so --resume, -c, -p all work).
+An interactive run first rebuilds the image if it is older than HCLAUDE_UPDATE_DAYS (default 7),
+which refreshes Claude Code and packages. Set HCLAUDE_NO_UPDATE=1 to skip that check.
+
+Environment: HCLAUDE_RAM_MIB (default 4096), HCLAUDE_CPUS (default 4),
+             HCLAUDE_UPDATE_DAYS (default 7), HCLAUDE_NO_UPDATE
+EOF
+}
+
+project_dir() {
+  local dir
+  dir="$(realpath "${1:-.}")"
+  if [ "$dir" = "/" ] || [ "$dir" = "$HOME" ]; then
+    echo "Refusing to mount $dir into the sandbox; pick a project directory." >&2
+    exit 1
+  fi
+  case "$dir" in
+    *:* | *,*) echo "Project path must not contain ':' or ','." >&2; exit 1 ;;
+  esac
+  echo "$dir"
+}
+
+# Host timezone name, passed to the VM at run time.
+host_tz() {
+  local tz
+  tz="$(readlink /etc/localtime 2>/dev/null)" && tz="${tz##*zoneinfo/}"
+  [ -n "$tz" ] || tz="$(timedatectl show -p Timezone --value 2>/dev/null)" || true
+  echo "${tz:-UTC}"
+}
+
+# Unique per project path, so same-named directories don't share an image.
+slug() {
+  printf '%s-%s' "$(basename "$1" | tr -c 'a-zA-Z0-9\n' '-' | tr 'A-Z' 'a-z')" \
+    "$(printf '%s' "$1" | sha1sum | cut -c1-8)"
+}
+
+ensure_volume() {
+  podman volume exists "$CONFIG_VOLUME" || podman volume create "$CONFIG_VOLUME" >/dev/null
+}
+
+build_base() {
+  podman build \
+    --build-arg HOST_UID="$(id -u)" --build-arg HOST_GID="$(id -g)" \
+    --build-arg REFRESH="$(date +%s)" \
+    -f "$HERE/Containerfile.base" -t "$BASE_IMAGE" "$HERE"
+}
+
+image_created() {
+  podman image inspect -f '{{.Created.Unix}}' "$1"
+}
+
+claude_version() {
+  podman run --rm --user appuser --entrypoint claude "$BASE_IMAGE" --version 2>/dev/null || echo unknown
+}
+
+# Rebuild the base image when it is older than UPDATE_DAYS. Interactive runs
+# only, so scripted use (-p, pipes) is never delayed. A failed update (e.g.
+# offline) keeps the existing image.
+maybe_update() {
+  [ "${HCLAUDE_NO_UPDATE:-}" = 1 ] && return 0
+  [ -t 0 ] && [ -t 1 ] || return 0
+  local age_days=$(( ( $(date +%s) - $(image_created "$BASE_IMAGE") ) / 86400 ))
+  [ "$age_days" -ge "$UPDATE_DAYS" ] || return 0
+
+  # Another session already updating: don't start a second build.
+  exec 9>"${XDG_RUNTIME_DIR:-/tmp}/hclaude-update.lock"
+  flock -n 9 || { exec 9>&-; return 0; }
+
+  local before; before="$(claude_version)"
+  echo "hclaude: sandbox image is $age_days days old; updating Claude Code and packages (HCLAUDE_NO_UPDATE=1 skips, \`$(basename "$0") update\` forces)..." >&2
+  if build_base >&2; then
+    echo "hclaude: Claude Code: $before -> $(claude_version)" >&2
+  else
+    echo "hclaude: update failed, continuing with the existing image" >&2
+  fi
+  exec 9>&-
+}
+
+build_project() {
+  podman build --build-arg BASE="$BASE_IMAGE" \
+    -f "$1/.hclaude/Containerfile" -t "hclaude-proj-$(slug "$1")" "$1/.hclaude"
+}
+
+cmd_init() {
+  local dir; dir="$(project_dir "${1:-.}")"
+  mkdir -p "$dir/.hclaude"
+  if [ ! -e "$dir/.hclaude/Containerfile" ]; then
+    cat >"$dir/.hclaude/Containerfile" <<'EOF'
+# Optional per-project toolchain layer on top of the base image.
+# Delete this file to use the base image as-is.
+# After editing, run: hclaude build
+ARG BASE=hclaude-base
+FROM ${BASE}
+
+USER root
+# RUN dnf install -y python3-devel nodejs golang && dnf clean all
+EOF
+  fi
+  ensure_volume
+  echo "Initialised $dir/.hclaude and volume $CONFIG_VOLUME"
+}
+
+cmd_build() {
+  local dir; dir="$(project_dir "${1:-.}")"
+  build_base
+  if [ -f "$dir/.hclaude/Containerfile" ]; then build_project "$dir"; fi
+}
+
+# launch <dir> <cmd...>
+launch() {
+  local dir="$1"; shift
+  ensure_volume
+
+  if ! podman image exists "$BASE_IMAGE"; then
+    echo "hclaude: first run, building the sandbox image (a few minutes)..." >&2
+    build_base >&2
+  else
+    maybe_update
+  fi
+  local image="$BASE_IMAGE"
+  if [ -f "$dir/.hclaude/Containerfile" ]; then
+    image="hclaude-proj-$(slug "$dir")"
+    if ! podman image exists "$image"; then
+      echo "hclaude: building the project image..." >&2
+      build_project "$dir" >&2
+    elif [ "$(image_created "$image")" -lt "$(image_created "$BASE_IMAGE")" ]; then
+      echo "hclaude: base image is newer; rebuilding the project image..." >&2
+      build_project "$dir" >&2 || echo "hclaude: project rebuild failed, using the existing image" >&2
+    fi
+  fi
+
+  # The project is mounted at its real host path so Claude's per-project
+  # history and trust settings stay separate. No other host mounts, no SSH
+  # agent socket, no credential env vars.
+  local tty=(-i); [ -t 0 ] && tty=(-it)
+  exec podman run --rm "${tty[@]}" \
+    --name "hclaude-$(slug "$dir")-$$" \
+    --runtime=krun \
+    --cgroup-parent=hclaude.slice \
+    --annotation "krun.ram_mib=$RAM_MIB" \
+    --annotation "krun.cpus=$CPUS" \
+    --userns=keep-id \
+    --user "$(id -u):$(id -g)" \
+    -v "$dir:$dir:U,z" \
+    -v "$CONFIG_VOLUME:/home/appuser/.claude:U,z" \
+    -w "$dir" \
+    -e CLAUDE_CONFIG_DIR=/home/appuser/.claude \
+    -e TERM="${TERM:-xterm-256color}" \
+    -e TZ="$(host_tz)" \
+    -e COLORTERM=truecolor \
+    "$image" "$@"
+}
+
+cmd_update() {
+  local before=none
+  podman image exists "$BASE_IMAGE" && before="$(claude_version)"
+  if [ -d "$HERE/.git" ]; then
+    git -C "$HERE" pull --ff-only
+  else
+    echo "hclaude: $HERE is not a git install, skipping wrapper update" >&2
+  fi
+  # Re-exec so the rebuild runs the freshly pulled code.
+  exec "$SELF" __rebuild "$before"
+}
+
+cmd_rebuild() {
+  local before="${1:-unknown}" dir
+  build_base
+  dir="$(realpath .)"
+  if [ "$dir" != / ] && [ "$dir" != "$HOME" ] && [ -f "$dir/.hclaude/Containerfile" ]; then
+    build_project "$dir"
+  fi
+  echo "hclaude: Claude Code: $before -> $(claude_version)" >&2
+}
+
+confirm() {
+  local reply
+  read -r -p "$1 [y/N] " reply 2>/dev/null </dev/tty || return 1
+  [[ "$reply" = [yY]* ]]
+}
+
+cmd_uninstall() {
+  local images
+  images="$(podman images --format '{{.Repository}}:{{.Tag}}' \
+    --filter "reference=$BASE_IMAGE" --filter 'reference=hclaude-proj-*')"
+  if [ -n "$images" ] && confirm "Remove the sandbox images? ($(echo $images))"; then
+    # shellcheck disable=SC2086
+    podman rmi $images
+  fi
+  if podman volume exists "$CONFIG_VOLUME" \
+      && confirm "Remove volume $CONFIG_VOLUME? This deletes the sandbox login and history."; then
+    podman volume rm "$CONFIG_VOLUME"
+  fi
+
+  if [ -L "$BIN_LINK" ] && [ "$(readlink -f "$BIN_LINK")" = "$SELF" ]; then
+    rm "$BIN_LINK"
+    echo "Removed $BIN_LINK"
+  fi
+  # Only delete the installer's checkout, never a development copy.
+  if [ "$HERE" = "$(realpath -m "$INSTALL_DIR")" ]; then
+    rm -rf "$HERE"
+    echo "Removed $HERE"
+  else
+    echo "Left $HERE in place (not the install directory $INSTALL_DIR)"
+  fi
+}
+
+cmd_run() {
+  local dir="."
+  if [ $# -gt 0 ] && [ "$1" != "--" ]; then dir="$1"; shift; fi
+  [ "${1:-}" = "--" ] && shift
+  [ $# -eq 0 ] && set -- claude
+  launch "$(project_dir "$dir")" "$@"
+}
+
+cmd_netcheck() {
+  [ $# -gt 0 ] || { echo "Usage: $(basename "$0") netcheck host:port..." >&2; exit 1; }
+  local targets="$*"
+  podman run --rm --runtime=krun --cgroup-parent=hclaude.slice fedora:44 bash -c '
+    rc=0
+    t() { timeout 3 bash -c "exec 3<>/dev/tcp/${1%:*}/${1##*:}" 2>/dev/null; }
+    t 1.1.1.1:443 && echo "OPEN    1.1.1.1:443 (internet control)" || { echo "blocked 1.1.1.1:443 (internet control)"; rc=1; }
+    for x in '"$targets"'; do
+      if t "$x"; then echo "OPEN    $x  <-- reachable"; rc=1; else echo "blocked $x"; fi
+    done
+    exit $rc' 2>&1 | grep -v init_or_kernel
+  return "${PIPESTATUS[0]}"
+}
+
+cmd_import_claude_md() {
+  local src="$HOME/.claude/CLAUDE.md"
+  [ -f "$src" ] || { echo "No $src to import." >&2; exit 1; }
+  ensure_volume
+  podman run --rm --security-opt label=disable \
+    -v "$CONFIG_VOLUME:/cfg" -v "$src:/in/CLAUDE.md:ro" \
+    --entrypoint cp "$BASE_IMAGE" /in/CLAUDE.md /cfg/CLAUDE.md
+  echo "Copied $src into volume $CONFIG_VOLUME"
+}
+
+case "${1:-}" in
+  init)             shift; cmd_init "$@" ;;
+  build)            shift; cmd_build "$@" ;;
+  run)              shift; cmd_run "$@" ;;
+  shell)            shift; cmd_run "${1:-.}" -- bash ;;
+  netcheck)         shift; cmd_netcheck "$@" ;;
+  import-claude-md) cmd_import_claude_md ;;
+  update)           cmd_update ;;
+  __rebuild)        shift; cmd_rebuild "$@" ;;
+  uninstall)        cmd_uninstall ;;
+  help)             usage ;;
+  *)                launch "$(project_dir .)" claude "$@" ;;
+esac
